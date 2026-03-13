@@ -1,0 +1,95 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build ${{ matrix.target }} on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact_name: ferry
+            artifact_suffix: linux-amd64
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            artifact_name: ferry
+            artifact_suffix: linux-aarch64
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact_name: ferry
+            artifact_suffix: macos-aarch64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact_name: ferry.exe
+            artifact_suffix: windows-amd64
+
+    steps:
+      - name: checkout
+        uses: actions/checkout@v6.0.1
+
+      - name: install rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1.15.2
+        with:
+          target: ${{ matrix.target }}
+
+      - name: install cross-compilation tools (Linux ARM)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: build
+        run: cargo build --release --target ${{ matrix.target }}
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+
+      - name: prepare artifact
+        shell: bash
+        run: |
+          cd target/${{ matrix.target }}/release
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            7z a ../../../ferry-${{ matrix.artifact_suffix }}.zip ${{ matrix.artifact_name }}
+          else
+            tar czf ../../../ferry-${{ matrix.artifact_suffix }}.tar.gz ${{ matrix.artifact_name }}
+          fi
+
+      - name: upload artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: ferry-${{ matrix.artifact_suffix }}
+          path: ferry-${{ matrix.artifact_suffix }}.*
+
+  release:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: download artifacts
+        uses: actions/download-artifact@v6
+        with:
+          path: artifacts
+
+      - name: flatten files
+        run: |
+          mkdir release-files
+          find artifacts -type f -name 'ferry-*' -exec mv {} release-files/ \;
+
+      - name: upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release-files/*
+          tag_name: ${{ github.ref_name }}
+          make_latest: true
+          generate_release_notes: true

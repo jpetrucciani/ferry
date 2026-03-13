@@ -1,0 +1,25 @@
+[package]
+name = "ferry"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Transparent MCP stdio-to-remote transport proxy"
+repository = "https://github.com/jpetrucciani/ferry"
+
+[[bin]]
+name = "ferry"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4.5.32", features = ["derive"] }
+reqwest = { version = "0.12.14", default-features = false, features = ["json", "rustls-tls", "socks", "stream"] }
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.140"
+tokio = { version = "1.44.1", features = ["io-std", "io-util", "macros", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-stream = "0.1.17"
+toml = "0.8.20"
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.19", features = ["fmt", "json"] }
+
+[dev-dependencies]
+tempfile = "3.19.1"
