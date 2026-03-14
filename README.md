@@ -1,5 +1,8 @@
 # ferry
 
+[![uses nix](https://img.shields.io/badge/uses-nix-%237EBAE4)](https://nixos.org/)
+![rust](https://img.shields.io/badge/Rust-1.95%2B-orange.svg)
+
 Transparent MCP stdio-to-remote transport proxy.
 
 `ferry` runs as a local stdio MCP server and forwards JSON-RPC traffic to a remote MCP server over HTTP. It prefers Streamable HTTP, can fall back to legacy SSE, and supports optional SOCKS5 proxying.
@@ -191,22 +194,9 @@ base_delay_ms = 1000
 
 ## Development
 
-With Nix:
-
 ```bash
-nix-shell
+nix-shell  # or direnv!
 cargo test
 cargo clippy --all --benches --tests --examples --all-features
 build_static
 ```
-
-Without Nix:
-
-```bash
-cargo build
-cargo test
-```
-
-## Status
-
-The binary is usable today for basic stdio-to-remote MCP proxying. Remaining work is mostly transport integration coverage and a few resumability edge cases. See [SPEC.md](./SPEC.md) and [TODO.md](./TODO.md) for the full design and implementation backlog.
