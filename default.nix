@@ -1,16 +1,16 @@
 { pkgs ? import
-  (fetchTarball {
-    name = "jpetrucciani-2026-03-06";
-    url = "https://github.com/jpetrucciani/nix/archive/2747da7206c6a736a3ec040b30e7e2b01ec02a40.tar.gz";
-    sha256 = "08flih0r4kc9x3pqj48g9ybpvhkrmcq0lz184h1jfn0k65hybfz6";
-  })
-  { overlays = [ _rust ]; }
-, _rust ? import
-  (fetchTarball {
-    name = "oxalica-2026-03-06";
-    url = "https://github.com/oxalica/rust-overlay/archive/629bbb7f9d02787a54e28398b411da849246253b.tar.gz";
-    sha256 = "1bfp6815dll8b9r5n3r55f9f9ayibm66w8nrzzyqd4bwhd2kvqlb";
-  })
+    (fetchTarball {
+      name = "jpetrucciani-2026-04-01";
+      url = "https://github.com/jpetrucciani/nix/archive/9a3a8de1ca81970ebf64c773c3ca9aa0301d7c90.tar.gz";
+      sha256 = "0gxfdzrwz9bb42byinwsjhmi72yifimhypjbv9v9g6haxza46l5y";
+    })
+    { overlays = [ rustOverlay ]; }
+, rustOverlay ? import
+    (fetchTarball {
+      name = "oxalica-2026-04-01";
+      url = "https://github.com/oxalica/rust-overlay/archive/e8046c1d9ccadd497c2344d8fa49dab62f22f7be.tar.gz";
+      sha256 = "0371f7g0sans86jbx4pkvcdmzn46fyk63mln7g8vzmjchgmfvync";
+    })
 }:
 let
   name = "ferry";
@@ -18,7 +18,7 @@ let
   target = "x86_64-unknown-linux-musl";
   rust = pkgs.rust-bin.selectLatestNightlyWith (toolchain: toolchain.default.override {
     extensions = [ "rust-src" "rustc-dev" "rust-analyzer" ];
-    targets = ["x86_64-pc-windows-gnu"  target ];
+    targets = [ "x86_64-pc-windows-gnu" target ];
   });
 
   rustPlatform = pkgs.makeRustPlatform {
@@ -26,7 +26,7 @@ let
     rustc = rust;
   };
 
- mingw = pkgs.pkgsCross.mingwW64;
+  mingw = pkgs.pkgsCross.mingwW64;
 
   tools = with pkgs; {
     cli = [

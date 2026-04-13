@@ -1,8 +1,9 @@
 use clap::Parser;
-use ferry::cli::Cli;
+use ferry::cli::{Cli, Command};
 use ferry::config::Config;
 use ferry::error::{Error, Result};
 use ferry::logging;
+use ferry::server::{self, ServeConfig};
 use ferry::stdio::StdioCodec;
 use ferry::transport::{build_transport, TransportEvent};
 use tokio::signal;
@@ -18,12 +19,21 @@ async fn main() {
 
 async fn try_main() -> Result<()> {
     let cli = Cli::parse();
-    let config = Config::load(cli)?;
-    logging::init(&config.logging)?;
-    run(config).await
+    match cli.command {
+        Some(Command::Serve(serve_cli)) => {
+            let config = ServeConfig::load(serve_cli)?;
+            logging::init(&config.logging)?;
+            server::run(config, shutdown_signal()).await
+        }
+        None => {
+            let config = Config::load(cli.proxy)?;
+            logging::init(&config.logging)?;
+            run_proxy(config).await
+        }
+    }
 }
 
-async fn run(config: Config) -> Result<()> {
+async fn run_proxy(config: Config) -> Result<()> {
     let mut stdio = StdioCodec::new(tokio::io::stdin(), tokio::io::stdout());
     let (mut transport, mut events) = build_transport(config)?;
     transport.connect().await?;
