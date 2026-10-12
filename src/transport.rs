@@ -1,11 +1,13 @@
+use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 use reqwest::header::{HeaderMap, ACCEPT, CONTENT_TYPE};
 use reqwest::{Response, StatusCode, Url};
 use serde_json::Value;
-use tokio::sync::{mpsc, watch, Notify, RwLock};
-use tokio::task::JoinHandle;
+use tokio::sync::{mpsc, watch, Mutex, RwLock};
+use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{sleep, timeout};
 use tokio_stream::StreamExt;
 use tracing::{debug, info, warn};
@@ -13,12 +15,11 @@ use tracing::{debug, info, warn};
 use crate::config::{Config, RetryConfig, Socks5Config, TransportMode};
 use crate::error::{Error, Result};
 use crate::retry::{
-    backoff_delay, compatibility_fallback_status, is_retryable_error, is_retryable_http_status,
-    unknown_session_status,
+    backoff_delay, compatibility_fallback_status, is_retryable_error, is_retryable_post_status,
+    is_undelivered_error, unknown_session_status,
 };
 use crate::sse::{SseEvent, SseParser};
 
-const EVENT_CHANNEL_CAPACITY: usize = 256;
 const USER_AGENT: &str = concat!("ferry/", env!("CARGO_PKG_VERSION"));
 const CONTENT_TYPE_JSON: &str = "application/json";
 const CONTENT_TYPE_SSE: &str = "text/event-stream";
@@ -48,7 +49,7 @@ enum TransportKind {
 struct AutoTransport {
     config: Config,
     sender: mpsc::Sender<TransportEvent>,
-    resolved: Option<ResolvedTransport>,
+    resolved: OnceLock<ResolvedTransport>,
 }
 
 #[derive(Debug)]
@@ -61,7 +62,7 @@ enum ResolvedTransport {
 struct StreamableHttpTransport {
     client: reqwest::Client,
     url: Url,
-    timeout: std::time::Duration,
+    timeout: Duration,
     retry: RetryConfig,
     sender: mpsc::Sender<TransportEvent>,
     session_id: Arc<RwLock<Option<String>>>,
@@ -69,34 +70,34 @@ struct StreamableHttpTransport {
     last_event_id: Arc<RwLock<Option<String>>>,
     listener_disabled: Arc<AtomicBool>,
     shutdown_tx: watch::Sender<bool>,
-    get_listener: Option<JoinHandle<()>>,
-    post_streams: Vec<JoinHandle<()>>,
+    get_listener: Mutex<Option<JoinHandle<()>>>,
+    post_streams: Mutex<JoinSet<()>>,
 }
 
 #[derive(Debug)]
 struct SseTransport {
     client: reqwest::Client,
     url: Url,
-    timeout: std::time::Duration,
+    timeout: Duration,
     retry: RetryConfig,
     sender: mpsc::Sender<TransportEvent>,
-    endpoint: Arc<RwLock<Option<Url>>>,
-    endpoint_ready: Arc<Notify>,
+    endpoint: Arc<watch::Sender<Option<Url>>>,
     last_event_id: Arc<RwLock<Option<String>>>,
     shutdown_tx: watch::Sender<bool>,
-    listener: Option<JoinHandle<()>>,
+    listener: Mutex<Option<JoinHandle<()>>>,
 }
 
+/// Builds a transport that reports server-initiated messages and fatal errors on `sender`.
 pub fn build_transport(
     config: Config,
-) -> Result<(TransportHandle, mpsc::Receiver<TransportEvent>)> {
-    let (sender, receiver) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
+    sender: mpsc::Sender<TransportEvent>,
+) -> Result<TransportHandle> {
     let handle = match config.transport {
         TransportMode::Auto => TransportHandle {
             inner: TransportKind::Auto(Box::new(AutoTransport {
                 config,
                 sender,
-                resolved: None,
+                resolved: OnceLock::new(),
             })),
         },
         TransportMode::StreamableHttp => {
@@ -115,28 +116,28 @@ pub fn build_transport(
         }
     };
 
-    Ok((handle, receiver))
+    Ok(handle)
 }
 
 impl TransportHandle {
-    pub async fn connect(&mut self) -> Result<()> {
-        match &mut self.inner {
+    pub async fn connect(&self) -> Result<()> {
+        match &self.inner {
             TransportKind::Auto(_) => Ok(()),
             TransportKind::StreamableHttp(transport) => transport.connect().await,
-            TransportKind::Sse(transport) => transport.connect().await,
+            TransportKind::Sse(transport) => transport.connect().await.map(|_| ()),
         }
     }
 
-    pub async fn send(&mut self, message: Value) -> Result<Option<Value>> {
-        match &mut self.inner {
+    pub async fn send(&self, message: Value) -> Result<Option<Value>> {
+        match &self.inner {
             TransportKind::Auto(transport) => transport.send(message).await,
             TransportKind::StreamableHttp(transport) => transport.send(message).await,
             TransportKind::Sse(transport) => transport.send(message).await,
         }
     }
 
-    pub async fn shutdown(&mut self) -> Result<()> {
-        match &mut self.inner {
+    pub async fn shutdown(&self) -> Result<()> {
+        match &self.inner {
             TransportKind::Auto(transport) => transport.shutdown().await,
             TransportKind::StreamableHttp(transport) => transport.shutdown().await,
             TransportKind::Sse(transport) => transport.shutdown().await,
@@ -145,8 +146,8 @@ impl TransportHandle {
 }
 
 impl AutoTransport {
-    async fn send(&mut self, message: Value) -> Result<Option<Value>> {
-        if let Some(transport) = &mut self.resolved {
+    async fn send(&self, message: Value) -> Result<Option<Value>> {
+        if let Some(transport) = self.resolved.get() {
             return transport.send(message).await;
         }
 
@@ -157,31 +158,38 @@ impl AutoTransport {
         }
 
         let client = build_client(&self.config)?;
-        let mut streamable =
+        let streamable =
             StreamableHttpTransport::new(self.config.clone(), client, self.sender.clone());
 
-        match streamable.send_initial_probe(message.clone()).await {
+        let (resolved, response) = match streamable.send_initial_probe(message.clone()).await {
             Ok(response) => {
                 info!("transport probe selected streamable-http");
-                self.resolved = Some(ResolvedTransport::StreamableHttp(Box::new(streamable)));
-                Ok(response)
+                (
+                    ResolvedTransport::StreamableHttp(Box::new(streamable)),
+                    response,
+                )
             }
             Err(Error::CompatibilityFallback(status)) => {
                 info!(status = %status, "transport probe falling back to legacy sse");
                 let client = build_client(&self.config)?;
-                let mut legacy =
-                    SseTransport::new(self.config.clone(), client, self.sender.clone());
+                let legacy = SseTransport::new(self.config.clone(), client, self.sender.clone());
                 legacy.connect().await?;
                 let response = legacy.send(message).await?;
-                self.resolved = Some(ResolvedTransport::Sse(Box::new(legacy)));
-                Ok(response)
+                (ResolvedTransport::Sse(Box::new(legacy)), response)
             }
-            Err(error) => Err(error),
+            Err(error) => return Err(error),
+        };
+
+        if self.resolved.set(resolved).is_err() {
+            return Err(Error::Message(
+                "auto transport received a second initialize request".to_string(),
+            ));
         }
+        Ok(response)
     }
 
-    async fn shutdown(&mut self) -> Result<()> {
-        if let Some(transport) = &mut self.resolved {
+    async fn shutdown(&self) -> Result<()> {
+        if let Some(transport) = self.resolved.get() {
             return transport.shutdown().await;
         }
         Ok(())
@@ -189,14 +197,14 @@ impl AutoTransport {
 }
 
 impl ResolvedTransport {
-    async fn send(&mut self, message: Value) -> Result<Option<Value>> {
+    async fn send(&self, message: Value) -> Result<Option<Value>> {
         match self {
             Self::StreamableHttp(transport) => transport.send(message).await,
             Self::Sse(transport) => transport.send(message).await,
         }
     }
 
-    async fn shutdown(&mut self) -> Result<()> {
+    async fn shutdown(&self) -> Result<()> {
         match self {
             Self::StreamableHttp(transport) => transport.shutdown().await,
             Self::Sse(transport) => transport.shutdown().await,
@@ -218,32 +226,30 @@ impl StreamableHttpTransport {
             last_event_id: Arc::new(RwLock::new(None)),
             listener_disabled: Arc::new(AtomicBool::new(false)),
             shutdown_tx,
-            get_listener: None,
-            post_streams: Vec::new(),
+            get_listener: Mutex::new(None),
+            post_streams: Mutex::new(JoinSet::new()),
         }
     }
 
-    async fn connect(&mut self) -> Result<()> {
+    async fn connect(&self) -> Result<()> {
         self.maybe_start_get_listener().await
     }
 
-    async fn send_initial_probe(&mut self, message: Value) -> Result<Option<Value>> {
+    async fn send_initial_probe(&self, message: Value) -> Result<Option<Value>> {
         self.send_internal(message, true).await
     }
 
-    async fn send(&mut self, message: Value) -> Result<Option<Value>> {
+    async fn send(&self, message: Value) -> Result<Option<Value>> {
         self.maybe_start_get_listener().await?;
         self.send_internal(message, false).await
     }
 
-    async fn shutdown(&mut self) -> Result<()> {
+    async fn shutdown(&self) -> Result<()> {
         let _ = self.shutdown_tx.send(true);
-        if let Some(handle) = self.get_listener.take() {
+        if let Some(handle) = self.get_listener.lock().await.take() {
             handle.abort();
         }
-        for handle in self.post_streams.drain(..) {
-            handle.abort();
-        }
+        self.post_streams.lock().await.abort_all();
 
         let session_id = { self.session_id.read().await.clone() };
         if let Some(session_id) = session_id {
@@ -269,20 +275,15 @@ impl StreamableHttpTransport {
         Ok(())
     }
 
-    async fn send_internal(
-        &mut self,
-        message: Value,
-        allow_fallback: bool,
-    ) -> Result<Option<Value>> {
+    async fn send_internal(&self, message: Value, allow_fallback: bool) -> Result<Option<Value>> {
         let initialize_id = initialize_request_id(&message);
         let had_session = self.session_id.read().await.is_some();
+        let limit = response_time_limit(&message, self.timeout);
 
         for attempt in 0..=self.retry.count {
-            let response = match self.send_once(&message).await {
+            let response = match self.send_once(&message, limit).await {
                 Ok(response) => response,
-                Err(error)
-                    if is_retryable_transport_error(&error) && attempt < self.retry.count =>
-                {
+                Err(error) if is_undelivered(&error) && attempt < self.retry.count => {
                     let delay = backoff_delay(&self.retry, attempt, None);
                     warn!(error = %error, attempt, delay_ms = delay.as_millis(), "streamable-http send failed, retrying");
                     sleep(delay).await;
@@ -304,7 +305,7 @@ impl StreamableHttpTransport {
                 ));
             }
 
-            if is_retryable_http_status(response.status()) && attempt < self.retry.count {
+            if is_retryable_post_status(response.status()) && attempt < self.retry.count {
                 let delay = backoff_delay(&self.retry, attempt, None);
                 warn!(
                     status = %response.status(),
@@ -352,7 +353,7 @@ impl StreamableHttpTransport {
                 .unwrap_or_default();
 
             if content_type.starts_with(CONTENT_TYPE_JSON) {
-                let value = read_response_json(response, self.timeout).await?;
+                let value = read_response_json(response, limit).await?;
                 if let Some(version) = extract_protocol_version(&value, initialize_id.as_ref()) {
                     *self.protocol_version.write().await = Some(version);
                 }
@@ -361,14 +362,17 @@ impl StreamableHttpTransport {
             }
 
             if content_type.starts_with(CONTENT_TYPE_SSE) {
-                let task = spawn_streamable_sse_reader(
-                    response,
-                    self.sender.clone(),
-                    self.last_event_id.clone(),
-                    self.protocol_version.clone(),
-                    initialize_id,
-                );
-                self.post_streams.push(task);
+                {
+                    let mut post_streams = self.post_streams.lock().await;
+                    while post_streams.try_join_next().is_some() {}
+                    post_streams.spawn(read_post_stream(
+                        response,
+                        self.sender.clone(),
+                        self.last_event_id.clone(),
+                        self.protocol_version.clone(),
+                        initialize_id,
+                    ));
+                }
                 self.maybe_start_get_listener().await?;
                 return Ok(None);
             }
@@ -379,7 +383,7 @@ impl StreamableHttpTransport {
         Err(Error::Message("request retry loop exhausted".to_string()))
     }
 
-    async fn send_once(&self, message: &Value) -> Result<Response> {
+    async fn send_once(&self, message: &Value, limit: Option<Duration>) -> Result<Response> {
         let mut request = self
             .client
             .post(self.url.clone())
@@ -394,20 +398,22 @@ impl StreamableHttpTransport {
             request = request.header(HEADER_MCP_PROTOCOL_VERSION, protocol_version);
         }
 
-        match timeout(self.timeout, request.send()).await {
-            Ok(result) => result.map_err(Into::into),
-            Err(_) => Err(Error::RequestTimeout(self.timeout)),
-        }
+        within(limit, request.send()).await
     }
 
-    async fn maybe_start_get_listener(&mut self) -> Result<()> {
-        if self.get_listener.is_some() || self.listener_disabled.load(Ordering::SeqCst) {
+    async fn maybe_start_get_listener(&self) -> Result<()> {
+        if self.listener_disabled.load(Ordering::SeqCst) {
             return Ok(());
         }
 
         let session_id = self.session_id.read().await.clone();
         let protocol_version = self.protocol_version.read().await.clone();
         if session_id.is_none() || protocol_version.is_none() {
+            return Ok(());
+        }
+
+        let mut get_listener = self.get_listener.lock().await;
+        if get_listener.is_some() {
             return Ok(());
         }
 
@@ -422,7 +428,7 @@ impl StreamableHttpTransport {
         let listener_disabled = self.listener_disabled.clone();
         let shutdown_rx = self.shutdown_tx.subscribe();
 
-        self.get_listener = Some(tokio::spawn(async move {
+        *get_listener = Some(tokio::spawn(async move {
             let mut attempt = 0usize;
             let mut retry_hint = None;
 
@@ -561,27 +567,27 @@ impl SseTransport {
             timeout: config.timeout,
             retry: config.retry,
             sender,
-            endpoint: Arc::new(RwLock::new(None)),
-            endpoint_ready: Arc::new(Notify::new()),
+            endpoint: Arc::new(watch::Sender::new(None)),
             last_event_id: Arc::new(RwLock::new(None)),
             shutdown_tx,
-            listener: None,
+            listener: Mutex::new(None),
         }
     }
 
-    async fn connect(&mut self) -> Result<()> {
-        if self.listener.is_none() {
+    /// Starts the SSE listener if needed and waits for the server's `endpoint` event.
+    async fn connect(&self) -> Result<Url> {
+        let mut listener = self.listener.lock().await;
+        if listener.is_none() {
             let client = self.client.clone();
             let url = self.url.clone();
             let timeout_duration = self.timeout;
             let retry = self.retry.clone();
             let sender = self.sender.clone();
             let endpoint = self.endpoint.clone();
-            let endpoint_ready = self.endpoint_ready.clone();
             let last_event_id = self.last_event_id.clone();
             let shutdown_rx = self.shutdown_tx.subscribe();
 
-            self.listener = Some(tokio::spawn(async move {
+            *listener = Some(tokio::spawn(async move {
                 let mut attempt = 0usize;
                 let mut retry_hint = None;
 
@@ -646,15 +652,8 @@ impl SseTransport {
                         break;
                     }
 
-                    match read_legacy_events(
-                        response,
-                        &sender,
-                        &url,
-                        &endpoint,
-                        &endpoint_ready,
-                        &last_event_id,
-                    )
-                    .await
+                    match read_legacy_events(response, &sender, &url, &endpoint, &last_event_id)
+                        .await
                     {
                         Ok(Some(delay)) => retry_hint = Some(delay),
                         Ok(None) => retry_hint = None,
@@ -669,20 +668,21 @@ impl SseTransport {
                 }
             }));
         }
+        drop(listener);
 
-        if self.endpoint.read().await.is_some() {
-            return Ok(());
-        }
-
-        match timeout(self.timeout, self.endpoint_ready.notified()).await {
-            Ok(_) => Ok(()),
-            Err(_) => Err(Error::RequestTimeout(self.timeout)),
-        }
+        let mut endpoint = self.endpoint.subscribe();
+        let resolved = match timeout(self.timeout, endpoint.wait_for(Option::is_some)).await {
+            Ok(Ok(value)) => value.clone(),
+            Ok(Err(_)) => return Err(Error::Shutdown),
+            Err(_) => return Err(Error::RequestTimeout(self.timeout)),
+        };
+        resolved.ok_or_else(|| {
+            Error::InvalidResponse("legacy SSE server never provided endpoint".to_string())
+        })
     }
 
-    async fn send(&mut self, message: Value) -> Result<Option<Value>> {
-        self.connect().await?;
-        let endpoint = self.wait_for_endpoint().await?;
+    async fn send(&self, message: Value) -> Result<Option<Value>> {
+        let endpoint = self.connect().await?;
 
         for attempt in 0..=self.retry.count {
             let request = self
@@ -696,7 +696,7 @@ impl SseTransport {
                     if response.status().is_success() || response.status() == StatusCode::ACCEPTED {
                         return Ok(None);
                     }
-                    if is_retryable_http_status(response.status()) && attempt < self.retry.count {
+                    if is_retryable_post_status(response.status()) && attempt < self.retry.count {
                         let delay = backoff_delay(&self.retry, attempt, None);
                         warn!(status = %response.status(), attempt, delay_ms = delay.as_millis(), "legacy sse POST returned retryable status");
                         sleep(delay).await;
@@ -708,21 +708,12 @@ impl SseTransport {
                         "legacy sse POST returned HTTP {status}: {body}"
                     )));
                 }
-                Ok(Err(error)) if is_retryable_error(&error) && attempt < self.retry.count => {
+                Ok(Err(error)) if is_undelivered_error(&error) && attempt < self.retry.count => {
                     let delay = backoff_delay(&self.retry, attempt, None);
                     warn!(error = %error, attempt, delay_ms = delay.as_millis(), "legacy sse POST failed, retrying");
                     sleep(delay).await;
                 }
                 Ok(Err(error)) => return Err(Error::from(error)),
-                Err(_) if attempt < self.retry.count => {
-                    let delay = backoff_delay(&self.retry, attempt, None);
-                    warn!(
-                        attempt,
-                        delay_ms = delay.as_millis(),
-                        "legacy sse POST timed out, retrying"
-                    );
-                    sleep(delay).await;
-                }
                 Err(_) => return Err(Error::RequestTimeout(self.timeout)),
             }
         }
@@ -732,26 +723,12 @@ impl SseTransport {
         ))
     }
 
-    async fn shutdown(&mut self) -> Result<()> {
+    async fn shutdown(&self) -> Result<()> {
         let _ = self.shutdown_tx.send(true);
-        if let Some(handle) = self.listener.take() {
+        if let Some(handle) = self.listener.lock().await.take() {
             handle.abort();
         }
         Ok(())
-    }
-
-    async fn wait_for_endpoint(&self) -> Result<Url> {
-        if let Some(endpoint) = self.endpoint.read().await.clone() {
-            return Ok(endpoint);
-        }
-
-        timeout(self.timeout, self.endpoint_ready.notified())
-            .await
-            .map_err(|_| Error::RequestTimeout(self.timeout))?;
-
-        self.endpoint.read().await.clone().ok_or_else(|| {
-            Error::InvalidResponse("legacy SSE server never provided endpoint".to_string())
-        })
     }
 }
 
@@ -805,6 +782,31 @@ fn message_is_initialize_request(message: &Value) -> bool {
     initialize_request_id(message).is_some()
 }
 
+/// JSON-RPC requests other than `initialize` can legitimately run for a long time (slow
+/// tool calls), so only connection setup bounds them. MCP clients enforce their own
+/// request timeouts and cancel through `notifications/cancelled`.
+fn response_time_limit(message: &Value, timeout: Duration) -> Option<Duration> {
+    let is_request = message.get("method").is_some() && message.get("id").is_some();
+    if is_request && !message_is_initialize_request(message) {
+        None
+    } else {
+        Some(timeout)
+    }
+}
+
+async fn within<T>(
+    limit: Option<Duration>,
+    future: impl Future<Output = reqwest::Result<T>>,
+) -> Result<T> {
+    match limit {
+        Some(limit) => match timeout(limit, future).await {
+            Ok(result) => result.map_err(Into::into),
+            Err(_) => Err(Error::RequestTimeout(limit)),
+        },
+        None => future.await.map_err(Into::into),
+    }
+}
+
 fn extract_protocol_version(value: &Value, expected_id: Option<&Value>) -> Option<String> {
     if let Some(values) = value.as_array() {
         for entry in values {
@@ -838,33 +840,17 @@ fn extract_header(headers: &HeaderMap, name: &str) -> Option<String> {
         .map(ToString::to_string)
 }
 
-fn is_retryable_transport_error(error: &Error) -> bool {
-    match error {
-        Error::Http(reqwest_error) => is_retryable_error(reqwest_error),
-        Error::RequestTimeout(_) => true,
-        _ => false,
-    }
+fn is_undelivered(error: &Error) -> bool {
+    matches!(error, Error::Http(error) if is_undelivered_error(error))
 }
 
-async fn read_response_json(
-    response: Response,
-    timeout_duration: std::time::Duration,
-) -> Result<Value> {
-    let bytes = match timeout(timeout_duration, response.bytes()).await {
-        Ok(result) => result?,
-        Err(_) => return Err(Error::RequestTimeout(timeout_duration)),
-    };
+async fn read_response_json(response: Response, limit: Option<Duration>) -> Result<Value> {
+    let bytes = within(limit, response.bytes()).await?;
     serde_json::from_slice(&bytes).map_err(Into::into)
 }
 
-async fn read_response_text(
-    response: Response,
-    timeout_duration: std::time::Duration,
-) -> Result<String> {
-    match timeout(timeout_duration, response.text()).await {
-        Ok(result) => result.map_err(Into::into),
-        Err(_) => Err(Error::RequestTimeout(timeout_duration)),
-    }
+async fn read_response_text(response: Response, limit: Duration) -> Result<String> {
+    within(Some(limit), response.text()).await
 }
 
 fn session_rejection_body(body: &str) -> bool {
@@ -879,7 +865,7 @@ async fn read_streamable_events(
     last_event_id: &Arc<RwLock<Option<String>>>,
     protocol_version: &Arc<RwLock<Option<String>>>,
     initialize_id: Option<Value>,
-) -> Result<Option<std::time::Duration>> {
+) -> Result<Option<Duration>> {
     let mut parser = SseParser::new();
     let mut stream = response.bytes_stream();
     let mut retry_hint = None;
@@ -924,10 +910,9 @@ async fn read_legacy_events(
     response: Response,
     sender: &mpsc::Sender<TransportEvent>,
     base_url: &Url,
-    endpoint: &Arc<RwLock<Option<Url>>>,
-    endpoint_ready: &Arc<Notify>,
+    endpoint: &watch::Sender<Option<Url>>,
     last_event_id: &Arc<RwLock<Option<String>>>,
-) -> Result<Option<std::time::Duration>> {
+) -> Result<Option<Duration>> {
     let mut parser = SseParser::new();
     let mut stream = response.bytes_stream();
     let mut retry_hint = None;
@@ -941,7 +926,7 @@ async fn read_legacy_events(
             if event.retry.is_some() {
                 retry_hint = event.retry;
             }
-            handle_legacy_event(event, sender, base_url, endpoint, endpoint_ready).await?;
+            handle_legacy_event(event, sender, base_url, endpoint).await?;
         }
     }
 
@@ -952,7 +937,7 @@ async fn read_legacy_events(
         if event.retry.is_some() {
             retry_hint = event.retry;
         }
-        handle_legacy_event(event, sender, base_url, endpoint, endpoint_ready).await?;
+        handle_legacy_event(event, sender, base_url, endpoint).await?;
     }
 
     Ok(retry_hint)
@@ -962,16 +947,14 @@ async fn handle_legacy_event(
     event: SseEvent,
     sender: &mpsc::Sender<TransportEvent>,
     base_url: &Url,
-    endpoint: &Arc<RwLock<Option<Url>>>,
-    endpoint_ready: &Arc<Notify>,
+    endpoint: &watch::Sender<Option<Url>>,
 ) -> Result<()> {
     if event.event == "endpoint" {
         let resolved = base_url
             .join(&event.data)
             .or_else(|_| Url::parse(&event.data))
             .map_err(|error| Error::Message(format!("invalid endpoint event URL: {error}")))?;
-        *endpoint.write().await = Some(resolved);
-        endpoint_ready.notify_waiters();
+        endpoint.send_replace(Some(resolved));
         return Ok(());
     }
 
@@ -984,26 +967,24 @@ async fn handle_legacy_event(
     Ok(())
 }
 
-fn spawn_streamable_sse_reader(
+async fn read_post_stream(
     response: Response,
     sender: mpsc::Sender<TransportEvent>,
     last_event_id: Arc<RwLock<Option<String>>>,
     protocol_version: Arc<RwLock<Option<String>>>,
     initialize_id: Option<Value>,
-) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        if let Err(error) = read_streamable_events(
-            response,
-            &sender,
-            &last_event_id,
-            &protocol_version,
-            initialize_id,
-        )
-        .await
-        {
-            warn!(error = %error, "streamable SSE response reader failed");
-        }
-    })
+) {
+    if let Err(error) = read_streamable_events(
+        response,
+        &sender,
+        &last_event_id,
+        &protocol_version,
+        initialize_id,
+    )
+    .await
+    {
+        warn!(error = %error, "streamable SSE response reader failed");
+    }
 }
 
 fn parse_json_message_from_event(event: &SseEvent) -> Result<Option<Value>> {

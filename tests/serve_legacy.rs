@@ -16,8 +16,11 @@ const PROTOCOL_VERSION: &str = "2025-11-25";
 #[tokio::test]
 async fn serve_legacy_stdio_works_with_sse_transport() -> Result<(), Box<dyn std::error::Error>> {
     let mut ferry = FerryProcess::spawn_stdio().await?;
-    let (mut transport, mut receiver) =
-        build_transport(legacy_transport_config(&format!("{}/sse", ferry.base_url))?)?;
+    let (sender, mut receiver) = mpsc::channel(32);
+    let transport = build_transport(
+        legacy_transport_config(&format!("{}/sse", ferry.base_url))?,
+        sender,
+    )?;
 
     transport.connect().await?;
     assert!(transport
@@ -104,8 +107,11 @@ async fn serve_legacy_relay_tunnels_to_upstream_ferry() -> Result<(), Box<dyn st
     let mut upstream = FerryProcess::spawn_stdio().await?;
     let mut relay =
         FerryProcess::spawn_relay(&format!("{}/mcp", upstream.base_url), "streamable-http").await?;
-    let (mut transport, mut receiver) =
-        build_transport(legacy_transport_config(&format!("{}/sse", relay.base_url))?)?;
+    let (sender, mut receiver) = mpsc::channel(32);
+    let transport = build_transport(
+        legacy_transport_config(&format!("{}/sse", relay.base_url))?,
+        sender,
+    )?;
 
     transport.connect().await?;
     assert!(transport

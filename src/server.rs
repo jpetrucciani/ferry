@@ -5,9 +5,9 @@ use std::net::SocketAddr;
 use std::pin::Pin;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, MutexGuard, PoisonError, Weak};
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::extract::{Query, State};
 use axum::http::header::{AUTHORIZATION, ORIGIN};
@@ -37,11 +37,15 @@ use crate::transport::{build_transport, TransportEvent, TransportHandle};
 const DEFAULT_TIMEOUT_SECONDS: u64 = 30;
 const DEFAULT_RETRY_COUNT: usize = 3;
 const DEFAULT_RETRY_DELAY_MS: u64 = 1_000;
+const DEFAULT_IDLE_TIMEOUT_SECONDS: u64 = 1_800;
 const HEADER_MCP_SESSION_ID: &str = "MCP-Session-Id";
 const HEADER_MCP_PROTOCOL_VERSION: &str = "MCP-Protocol-Version";
 const HEADER_LAST_EVENT_ID: &str = "Last-Event-ID";
 const GET_STREAM_CAPACITY: usize = 256;
 const SSE_REPLAY_HISTORY_LIMIT: usize = 256;
+const QUEUED_MESSAGE_LIMIT: usize = 1_024;
+const RELAY_EVENT_CHANNEL_CAPACITY: usize = 256;
+const IDLE_REAPER_MAX_INTERVAL: Duration = Duration::from_secs(60);
 const LEGACY_SESSION_RECONNECT_GRACE: Duration = Duration::from_secs(30);
 const SESSION_SHUTDOWN_GRACE: Duration = Duration::from_secs(3);
 
@@ -54,6 +58,7 @@ pub struct ServeConfig {
     pub health_path: String,
     pub auth: ServeAuthConfig,
     pub allow_origins: Vec<HeaderValue>,
+    pub idle_timeout: Duration,
     pub logging: LoggingConfig,
     pub backend: ServeBackendConfig,
 }
@@ -100,7 +105,6 @@ struct SessionRegistry {
 struct SessionRegistryInner {
     backend: ServeBackendConfig,
     sessions: RwLock<HashMap<String, Arc<SessionState>>>,
-    next_session_id: AtomicU64,
 }
 
 struct SessionState {
@@ -111,7 +115,8 @@ struct SessionState {
     active_get_stream: Mutex<Option<ActiveGetStream>>,
     replay_history: Mutex<VecDeque<SseMessage>>,
     queued_messages: Mutex<VecDeque<SseMessage>>,
-    pending_requests: Mutex<HashMap<String, PendingRequestTarget>>,
+    pending_requests: std::sync::Mutex<HashMap<String, PendingRequestTarget>>,
+    last_activity: std::sync::Mutex<Instant>,
     legacy_cleanup_task: Mutex<Option<JoinHandle<()>>>,
     legacy_session: bool,
     next_get_stream_id: AtomicU64,
@@ -125,7 +130,7 @@ struct StdioSessionBackend {
 }
 
 struct RelaySessionBackend {
-    transport: Mutex<TransportHandle>,
+    transport: TransportHandle,
 }
 
 enum SessionBackend {
@@ -165,6 +170,34 @@ struct ParsedSseEventId {
 enum PendingRequestTarget {
     Http(oneshot::Sender<Result<Value>>),
     Sse,
+}
+
+/// Owns the response channel for an HTTP request routed to the backend. Dropping it (the
+/// response arrived, the send failed, or the HTTP client disconnected) releases the request id
+/// so a later request can reuse it.
+struct PendingHttpRequest<'a> {
+    session: &'a SessionState,
+    id_key: String,
+    receiver: Option<oneshot::Receiver<Result<Value>>>,
+}
+
+impl Drop for PendingHttpRequest<'_> {
+    fn drop(&mut self) {
+        drop(self.receiver.take());
+        let mut pending = self.session.pending_requests();
+        // Only remove our own entry; a closed sender means its receiver (ours) is gone.
+        if matches!(
+            pending.get(&self.id_key),
+            Some(PendingRequestTarget::Http(sender)) if sender.is_closed()
+        ) {
+            pending.remove(&self.id_key);
+        }
+    }
+}
+
+enum InitializeOutcome {
+    Ready { session_id: String, response: Value },
+    Rejected(Value),
 }
 
 #[derive(Debug)]
@@ -227,6 +260,13 @@ impl ServeConfig {
             file: cli.log_file,
         };
 
+        let idle_timeout_seconds = cli.idle_timeout.unwrap_or(DEFAULT_IDLE_TIMEOUT_SECONDS);
+        if idle_timeout_seconds == 0 {
+            return Err(Error::Message(
+                "serve idle timeout must be at least 1 second".to_string(),
+            ));
+        }
+
         let backend = match cli.backend {
             Some(ServeBackendCli::Stdio(stdio)) => {
                 ServeBackendConfig::Stdio(parse_stdio_backend(stdio)?)
@@ -251,6 +291,7 @@ impl ServeConfig {
             health_path,
             auth,
             allow_origins,
+            idle_timeout: Duration::from_secs(idle_timeout_seconds),
             logging,
             backend,
         })
@@ -378,16 +419,20 @@ impl SessionRegistry {
             inner: Arc::new(SessionRegistryInner {
                 backend,
                 sessions: RwLock::new(HashMap::new()),
-                next_session_id: AtomicU64::new(1),
             }),
         }
     }
 
-    fn next_session_id(&self) -> String {
-        format!(
-            "ferry-session-{}",
-            self.inner.next_session_id.fetch_add(1, Ordering::SeqCst)
-        )
+    /// Session ids double as the legacy `/messages` capability, so they must be unguessable.
+    fn next_session_id(&self) -> Result<String> {
+        let mut bytes = [0_u8; 16];
+        getrandom::getrandom(&mut bytes)
+            .map_err(|error| Error::Message(format!("failed to generate session id: {error}")))?;
+        let hex = bytes
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        Ok(format!("ferry-{hex}"))
     }
 
     async fn spawn_session(
@@ -408,7 +453,7 @@ impl SessionRegistry {
     }
 
     async fn create_legacy_session(&self) -> Result<(String, Arc<SessionState>)> {
-        let session_id = self.next_session_id();
+        let session_id = self.next_session_id()?;
         let session = self.spawn_session(session_id.clone(), true).await?;
         self.inner
             .sessions
@@ -418,11 +463,14 @@ impl SessionRegistry {
         Ok((session_id, session))
     }
 
-    async fn initialize_session(&self, message: Value) -> Result<(String, Value)> {
-        let session_id = self.next_session_id();
+    async fn initialize_session(&self, message: Value) -> Result<InitializeOutcome> {
+        let initialize_id = request_id(&message).ok_or_else(|| {
+            Error::InvalidResponse("initialize request was missing an id".to_string())
+        })?;
+        let session_id = self.next_session_id()?;
         let session = self.spawn_session(session_id.clone(), false).await?;
 
-        let response = match session.send_request(message.clone()).await {
+        let response = match session.send_request(message).await {
             Ok(response) => response,
             Err(error) => {
                 let _ = session.shutdown().await;
@@ -430,15 +478,18 @@ impl SessionRegistry {
             }
         };
 
-        let initialize_id = request_id(&message).ok_or_else(|| {
-            Error::InvalidResponse("initialize request was missing an id".to_string())
-        })?;
-        let protocol_version = extract_protocol_version(&response, Some(&initialize_id))
-            .ok_or_else(|| {
-                Error::InvalidResponse(
-                    "initialize response missing result.protocolVersion".to_string(),
-                )
-            })?;
+        let Some(protocol_version) = extract_protocol_version(&response, Some(&initialize_id))
+        else {
+            let _ = session.shutdown().await;
+            // A JSON-RPC error (for example an unsupported protocol version) belongs to the
+            // client; anything else is a broken backend.
+            if response.get("error").is_some() {
+                return Ok(InitializeOutcome::Rejected(response));
+            }
+            return Err(Error::InvalidResponse(
+                "initialize response missing result.protocolVersion".to_string(),
+            ));
+        };
         *session.protocol_version.write().await = Some(protocol_version);
 
         self.inner
@@ -447,7 +498,10 @@ impl SessionRegistry {
             .await
             .insert(session_id.clone(), session);
 
-        Ok((session_id, response))
+        Ok(InitializeOutcome::Ready {
+            session_id,
+            response,
+        })
     }
 
     async fn get(&self, session_id: &str) -> Option<Arc<SessionState>> {
@@ -456,6 +510,41 @@ impl SessionRegistry {
 
     async fn remove(&self, session_id: &str) -> Option<Arc<SessionState>> {
         self.inner.sessions.write().await.remove(session_id)
+    }
+
+    /// Shuts down sessions that clients abandoned without a DELETE.
+    fn spawn_idle_reaper(&self, idle_timeout: Duration) {
+        let registry = Arc::downgrade(&self.inner);
+        let interval = (idle_timeout / 4).clamp(Duration::from_secs(1), IDLE_REAPER_MAX_INTERVAL);
+        tokio::spawn(async move {
+            loop {
+                sleep(interval).await;
+                let Some(inner) = registry.upgrade() else {
+                    break;
+                };
+                let registry = SessionRegistry { inner };
+
+                let sessions = registry
+                    .inner
+                    .sessions
+                    .read()
+                    .await
+                    .values()
+                    .cloned()
+                    .collect::<Vec<_>>();
+                for session in sessions {
+                    if !session.is_idle(idle_timeout).await {
+                        continue;
+                    }
+                    if registry.remove(&session.id).await.is_some() {
+                        info!(session_id = %session.id, "shutting down idle session");
+                        if let Err(error) = session.shutdown().await {
+                            warn!(session_id = %session.id, error = %error, "failed to shut down idle session");
+                        }
+                    }
+                }
+            }
+        });
     }
 }
 
@@ -505,7 +594,8 @@ impl SessionState {
             active_get_stream: Mutex::new(None),
             replay_history: Mutex::new(VecDeque::new()),
             queued_messages: Mutex::new(VecDeque::new()),
-            pending_requests: Mutex::new(HashMap::new()),
+            pending_requests: std::sync::Mutex::new(HashMap::new()),
+            last_activity: std::sync::Mutex::new(Instant::now()),
             legacy_cleanup_task: Mutex::new(None),
             legacy_session,
             next_get_stream_id: AtomicU64::new(1),
@@ -523,20 +613,20 @@ impl SessionState {
         config: ServeRelayConfig,
         legacy_session: bool,
     ) -> Result<Arc<Self>> {
-        let (mut transport, receiver) = build_transport(build_relay_transport_config(&config)?)?;
+        let (sender, receiver) = mpsc::channel(RELAY_EVENT_CHANNEL_CAPACITY);
+        let transport = build_transport(build_relay_transport_config(&config)?, sender)?;
         transport.connect().await?;
 
         let session = Arc::new(Self {
             id: session_id,
             registry,
-            backend: SessionBackend::Relay(RelaySessionBackend {
-                transport: Mutex::new(transport),
-            }),
+            backend: SessionBackend::Relay(RelaySessionBackend { transport }),
             protocol_version: RwLock::new(None),
             active_get_stream: Mutex::new(None),
             replay_history: Mutex::new(VecDeque::new()),
             queued_messages: Mutex::new(VecDeque::new()),
-            pending_requests: Mutex::new(HashMap::new()),
+            pending_requests: std::sync::Mutex::new(HashMap::new()),
+            last_activity: std::sync::Mutex::new(Instant::now()),
             legacy_cleanup_task: Mutex::new(None),
             legacy_session,
             next_get_stream_id: AtomicU64::new(1),
@@ -630,23 +720,23 @@ impl SessionState {
         let id_key = jsonrpc_id_key(&id)?;
         let (sender, receiver) = oneshot::channel();
 
-        self.insert_pending_request(id_key.clone(), PendingRequestTarget::Http(sender))
-            .await?;
-
-        let direct_response = match self.backend.send(&message).await {
-            Ok(response) => response,
-            Err(error) => {
-                self.pending_requests.lock().await.remove(&id_key);
-                return Err(error);
-            }
+        self.insert_pending_request(id_key.clone(), PendingRequestTarget::Http(sender))?;
+        let mut pending = PendingHttpRequest {
+            session: self,
+            id_key,
+            receiver: Some(receiver),
         };
 
-        if let Some(response) = direct_response {
-            self.pending_requests.lock().await.remove(&id_key);
+        if let Some(response) = self.backend.send(&message).await? {
             self.record_protocol_version_from_message(&response).await;
             return Ok(response);
         }
 
+        let Some(receiver) = pending.receiver.as_mut() else {
+            return Err(Error::Message(
+                "pending request lost its receiver".to_string(),
+            ));
+        };
         match receiver.await {
             Ok(result) => result,
             Err(_) => Err(Error::Message(
@@ -659,19 +749,18 @@ impl SessionState {
         let id = request_id(&message)
             .ok_or_else(|| Error::Message("request is missing a JSON-RPC id".to_string()))?;
         let id_key = jsonrpc_id_key(&id)?;
-        self.insert_pending_request(id_key.clone(), PendingRequestTarget::Sse)
-            .await?;
+        self.insert_pending_request(id_key.clone(), PendingRequestTarget::Sse)?;
 
         let direct_response = match self.backend.send(&message).await {
             Ok(response) => response,
             Err(error) => {
-                self.pending_requests.lock().await.remove(&id_key);
+                self.pending_requests().remove(&id_key);
                 return Err(error);
             }
         };
 
         if let Some(response) = direct_response {
-            self.pending_requests.lock().await.remove(&id_key);
+            self.pending_requests().remove(&id_key);
             self.record_protocol_version_from_message(&response).await;
             self.queue_backend_message(response).await?;
         }
@@ -679,12 +768,39 @@ impl SessionState {
         Ok(())
     }
 
-    async fn insert_pending_request(
-        &self,
-        id_key: String,
-        target: PendingRequestTarget,
-    ) -> Result<()> {
-        let mut pending = self.pending_requests.lock().await;
+    fn pending_requests(&self) -> MutexGuard<'_, HashMap<String, PendingRequestTarget>> {
+        self.pending_requests
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn touch(&self) {
+        *self
+            .last_activity
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Instant::now();
+    }
+
+    async fn is_idle(&self, idle_timeout: Duration) -> bool {
+        let last_activity = *self
+            .last_activity
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if last_activity.elapsed() < idle_timeout || !self.pending_requests().is_empty() {
+            return false;
+        }
+
+        let stream_open = self
+            .active_get_stream
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|stream| !stream.sender.is_closed());
+        !stream_open
+    }
+
+    fn insert_pending_request(&self, id_key: String, target: PendingRequestTarget) -> Result<()> {
+        let mut pending = self.pending_requests();
         if pending.contains_key(&id_key) {
             return Err(Error::Message(format!(
                 "request id {id_key} is already outstanding for this session"
@@ -694,8 +810,8 @@ impl SessionState {
         Ok(())
     }
 
-    async fn has_outstanding_request(&self, id_key: &str) -> bool {
-        self.pending_requests.lock().await.contains_key(id_key)
+    fn has_outstanding_request(&self, id_key: &str) -> bool {
+        self.pending_requests().contains_key(id_key)
     }
 
     async fn send_oneway(&self, message: Value) -> Result<()> {
@@ -797,7 +913,16 @@ impl SessionState {
             }
         }
 
-        self.queued_messages.lock().await.push_back(queued);
+        let mut queued_messages = self.queued_messages.lock().await;
+        if queued_messages.len() >= QUEUED_MESSAGE_LIMIT {
+            queued_messages.pop_front();
+            warn!(
+                session_id = %self.id,
+                limit = QUEUED_MESSAGE_LIMIT,
+                "no client stream is open, dropping the oldest queued server message"
+            );
+        }
+        queued_messages.push_back(queued);
         Ok(())
     }
 
@@ -806,7 +931,7 @@ impl SessionState {
 
         if let Some(id) = response_id(&message) {
             let key = jsonrpc_id_key(&id)?;
-            let pending = self.pending_requests.lock().await.remove(&key);
+            let pending = self.pending_requests().remove(&key);
             if let Some(target) = pending {
                 match target {
                     PendingRequestTarget::Http(sender) => {
@@ -868,10 +993,7 @@ impl SessionState {
         self.cancel_legacy_cleanup().await;
         self.active_get_stream.lock().await.take();
 
-        let pending = {
-            let mut pending = self.pending_requests.lock().await;
-            pending.drain().collect::<Vec<_>>()
-        };
+        let pending = self.pending_requests().drain().collect::<Vec<_>>();
         for (_, target) in pending {
             if let PendingRequestTarget::Http(sender) = target {
                 let _ = sender.send(Err(Error::Message(format!(
@@ -906,10 +1028,7 @@ impl SessionState {
         }
         self.active_get_stream.lock().await.take();
 
-        let pending = {
-            let mut pending = self.pending_requests.lock().await;
-            pending.drain().collect::<Vec<_>>()
-        };
+        let pending = self.pending_requests().drain().collect::<Vec<_>>();
         for (_, target) in pending {
             if let PendingRequestTarget::Http(sender) = target {
                 let _ = sender.send(Err(Error::Shutdown));
@@ -954,13 +1073,11 @@ impl StdioSessionBackend {
 
 impl RelaySessionBackend {
     async fn send(&self, message: &Value) -> Result<Option<Value>> {
-        let mut transport = self.transport.lock().await;
-        transport.send(message.clone()).await
+        self.transport.send(message.clone()).await
     }
 
     async fn shutdown(&self) -> Result<()> {
-        let mut transport = self.transport.lock().await;
-        transport.shutdown().await
+        self.transport.shutdown().await
     }
 }
 
@@ -1014,8 +1131,10 @@ where
 }
 
 fn build_app(config: ServeConfig) -> Router {
+    let sessions = SessionRegistry::new(config.backend.clone());
+    sessions.spawn_idle_reaper(config.idle_timeout);
     let state = AppState {
-        sessions: SessionRegistry::new(config.backend.clone()),
+        sessions,
         config: Arc::new(config),
     };
 
@@ -1076,6 +1195,7 @@ async fn post_mcp_handler(
                 .await
                 .ok_or_else(|| HttpError::not_found("unknown MCP session"))?;
             validate_protocol_version_header(&session, &headers).await?;
+            session.touch();
 
             if matches!(
                 message_kind,
@@ -1088,7 +1208,7 @@ async fn post_mcp_handler(
 
             match message_kind {
                 JsonRpcMessageKind::Request { id_key, .. } => {
-                    if session.has_outstanding_request(&id_key).await {
+                    if session.has_outstanding_request(&id_key) {
                         return Err(HttpError::conflict(
                             "request id is already outstanding for this session",
                         ));
@@ -1115,11 +1235,20 @@ async fn post_mcp_handler(
         }
         None => match message_kind {
             JsonRpcMessageKind::Request { method, .. } if method == "initialize" => {
-                let (session_id, response) = state
+                let outcome = state
                     .sessions
                     .initialize_session(message)
                     .await
                     .map_err(as_backend_error)?;
+                let (session_id, response) = match outcome {
+                    InitializeOutcome::Ready {
+                        session_id,
+                        response,
+                    } => (session_id, response),
+                    InitializeOutcome::Rejected(response) => {
+                        return Ok(Json(response).into_response());
+                    }
+                };
                 let mut response = Json(response).into_response();
                 response.headers_mut().insert(
                     HeaderName::from_static("content-type"),
@@ -1155,6 +1284,7 @@ async fn get_mcp_handler(
         .await
         .ok_or_else(|| HttpError::not_found("unknown MCP session"))?;
     validate_protocol_version_header(&session, &headers).await?;
+    session.touch();
     let replay_after_sequence = match header_value(&headers, HEADER_LAST_EVENT_ID) {
         Some(last_event_id) => {
             let parsed = parse_sse_event_id(&last_event_id)
@@ -1227,6 +1357,7 @@ async fn get_legacy_sse_handler(
         }
     };
 
+    session.touch();
     let (receiver, replaced) = session.open_get_stream(replay_after_sequence).await;
     if replaced {
         info!(
@@ -1271,6 +1402,7 @@ async fn post_legacy_messages_handler(
         .get(&query.session_id)
         .await
         .ok_or_else(|| HttpError::not_found("unknown MCP session"))?;
+    session.touch();
     let initialized = session.protocol_version.read().await.is_some();
     let message_kind = classify_message(&message)?;
 
@@ -1286,7 +1418,7 @@ async fn post_legacy_messages_handler(
                     "legacy sessions must start with an initialize request",
                 ));
             }
-            if session.has_outstanding_request(&id_key).await {
+            if session.has_outstanding_request(&id_key) {
                 return Err(HttpError::conflict(
                     "request id is already outstanding for this session",
                 ));
@@ -1518,8 +1650,10 @@ async fn validate_protocol_version_header(
         .ok_or_else(|| {
             HttpError::bad_gateway("session is missing a negotiated protocol version")
         })?;
-    let actual = header_value(headers, HEADER_MCP_PROTOCOL_VERSION)
-        .ok_or_else(|| HttpError::bad_request("missing MCP-Protocol-Version header"))?;
+    // Clients on 2025-03-26 predate the header; the version negotiated at initialize applies.
+    let Some(actual) = header_value(headers, HEADER_MCP_PROTOCOL_VERSION) else {
+        return Ok(());
+    };
     if actual != expected {
         return Err(HttpError::bad_request(format!(
             "MCP-Protocol-Version must be {expected}"
@@ -1631,6 +1765,7 @@ mod tests {
             auth_bearer_token: None,
             auth_headers: Vec::new(),
             allow_origins: Vec::new(),
+            idle_timeout: None,
             log_level: Some(crate::cli::LogLevelArg::Warn),
             log_file: None,
             config: None,
@@ -1762,6 +1897,7 @@ mod tests {
             auth_bearer_token: None,
             auth_headers: Vec::new(),
             allow_origins: Vec::new(),
+            idle_timeout: None,
             log_level: Some(crate::cli::LogLevelArg::Warn),
             log_file: None,
             config: None,

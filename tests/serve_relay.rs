@@ -78,3 +78,57 @@ async fn serve_relay_tunnels_to_upstream_ferry() -> Result<(), Box<dyn std::erro
     upstream.shutdown().await?;
     Ok(())
 }
+
+#[tokio::test]
+async fn serve_relay_runs_slow_requests_concurrently_past_timeout(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut upstream = FerryProcess::spawn_stdio().await?;
+    let mut relay = FerryProcess::spawn_relay_with(
+        &format!("{}/mcp", upstream.base_url),
+        "streamable-http",
+        &["--timeout", "1"],
+    )
+    .await?;
+    let client = reqwest::Client::new();
+
+    let initialize = client
+        .post(format!("{}/mcp", relay.base_url))
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": { "protocolVersion": PROTOCOL_VERSION }
+        }))
+        .send()
+        .await?;
+    let session_id = header_str(initialize.headers(), "mcp-session-id")?.to_string();
+
+    let echo = |id: u64, value: &'static str, delay_ms: u64| {
+        let request = client
+            .post(format!("{}/mcp", relay.base_url))
+            .header("mcp-session-id", &session_id)
+            .header("mcp-protocol-version", PROTOCOL_VERSION)
+            .json(&json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "delayed_echo",
+                "params": { "value": value, "delayMs": delay_ms }
+            }));
+        async move {
+            let body: Value = request.send().await?.json().await?;
+            Ok::<_, reqwest::Error>((body, tokio::time::Instant::now()))
+        }
+    };
+
+    // The slow request outlives the 1s relay timeout and must neither fail nor be resent,
+    // and it must not block the fast request behind it.
+    let ((slow, slow_done), (fast, fast_done)) =
+        tokio::try_join!(echo(2, "slow", 1_500), echo(3, "fast", 0))?;
+    assert_eq!(slow["result"]["echo"], json!("slow"));
+    assert_eq!(fast["result"]["echo"], json!("fast"));
+    assert!(fast_done < slow_done);
+
+    relay.shutdown().await?;
+    upstream.shutdown().await?;
+    Ok(())
+}

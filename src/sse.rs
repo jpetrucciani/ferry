@@ -17,6 +17,7 @@ pub struct SseParser {
     current_data: String,
     current_id: Option<String>,
     current_retry: Option<Duration>,
+    skip_leading_lf: bool,
 }
 
 impl SseParser {
@@ -28,16 +29,7 @@ impl SseParser {
         self.buffer.extend_from_slice(chunk);
         let mut events = Vec::new();
 
-        while let Some(position) = self.find_line_end() {
-            let mut line = self.buffer.drain(..position).collect::<Vec<u8>>();
-            let has_cr = line.last().copied() == Some(b'\r');
-            if has_cr {
-                line.pop();
-            }
-            if self.buffer.first().copied() == Some(b'\n') {
-                self.buffer.drain(..1);
-            }
-
+        while let Some(line) = self.next_line() {
             let line = String::from_utf8(line)
                 .map_err(|error| Error::Message(format!("invalid SSE UTF-8: {error}")))?;
 
@@ -83,8 +75,32 @@ impl SseParser {
         self.finish_event()
     }
 
-    fn find_line_end(&self) -> Option<usize> {
-        self.buffer.iter().position(|byte| *byte == b'\n')
+    /// Splits off the next line, accepting CRLF, LF, or a bare CR as the terminator.
+    fn next_line(&mut self) -> Option<Vec<u8>> {
+        if self.skip_leading_lf && !self.buffer.is_empty() {
+            self.skip_leading_lf = false;
+            if self.buffer[0] == b'\n' {
+                self.buffer.drain(..1);
+            }
+        }
+
+        let position = self
+            .buffer
+            .iter()
+            .position(|byte| *byte == b'\n' || *byte == b'\r')?;
+        let terminator_len = match (self.buffer[position], self.buffer.get(position + 1)) {
+            (b'\r', Some(b'\n')) => 2,
+            (b'\r', None) => {
+                // The matching LF of a CRLF may arrive with the next chunk.
+                self.skip_leading_lf = true;
+                1
+            }
+            _ => 1,
+        };
+
+        let line = self.buffer[..position].to_vec();
+        self.buffer.drain(..position + terminator_len);
+        Some(line)
     }
 
     fn finish_event(&mut self) -> Option<SseEvent> {
@@ -140,5 +156,18 @@ mod tests {
                 retry: Some(Duration::from_millis(1_500)),
             }]
         );
+    }
+
+    #[test]
+    fn accepts_cr_line_endings_across_chunks() {
+        let mut parser = SseParser::new();
+        let mut events = parser.feed(b"data: one\r").expect("parse");
+        events.extend(parser.feed(b"\n\rdata: two\r\r").expect("parse"));
+
+        let data = events
+            .into_iter()
+            .map(|event| event.data)
+            .collect::<Vec<_>>();
+        assert_eq!(data, vec!["one".to_string(), "two".to_string()]);
     }
 }

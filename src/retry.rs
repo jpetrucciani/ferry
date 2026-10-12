@@ -4,11 +4,12 @@ use reqwest::StatusCode;
 
 use crate::config::RetryConfig;
 
-pub fn is_retryable_http_status(status: StatusCode) -> bool {
-    matches!(
-        status,
-        StatusCode::BAD_GATEWAY | StatusCode::SERVICE_UNAVAILABLE | StatusCode::GATEWAY_TIMEOUT
-    )
+const MAX_BACKOFF: Duration = Duration::from_secs(30);
+
+/// Statuses that mean a POST was refused before the server acted on it.
+/// 502 and 504 are excluded because the upstream may already have processed the message.
+pub fn is_retryable_post_status(status: StatusCode) -> bool {
+    status == StatusCode::SERVICE_UNAVAILABLE
 }
 
 pub fn compatibility_fallback_status(status: StatusCode) -> bool {
@@ -22,19 +23,33 @@ pub fn unknown_session_status(status: StatusCode) -> bool {
     matches!(status, StatusCode::BAD_REQUEST | StatusCode::NOT_FOUND)
 }
 
+/// Errors worth retrying for idempotent requests.
 pub fn is_retryable_error(error: &reqwest::Error) -> bool {
     error.is_timeout() || error.is_connect() || error.is_request()
 }
 
+/// Errors where the POST body was never delivered, so resending cannot duplicate it.
+pub fn is_undelivered_error(error: &reqwest::Error) -> bool {
+    error.is_connect()
+}
+
+/// A server-provided SSE `retry:` hint is honored as-is; otherwise the delay grows
+/// exponentially from the configured base, capped at `MAX_BACKOFF`, plus jitter.
 pub fn backoff_delay(
     config: &RetryConfig,
     attempt: usize,
     retry_hint: Option<Duration>,
 ) -> Duration {
-    let base = retry_hint.unwrap_or(config.base_delay);
+    if let Some(hint) = retry_hint {
+        return hint;
+    }
+
     let multiplier = 1_u32 << attempt.min(31);
-    let scaled = base.saturating_mul(multiplier);
-    scaled.saturating_add(jitter(base))
+    let scaled = config
+        .base_delay
+        .saturating_mul(multiplier)
+        .min(MAX_BACKOFF);
+    scaled.saturating_add(jitter(config.base_delay))
 }
 
 fn jitter(base: Duration) -> Duration {
@@ -57,13 +72,13 @@ mod tests {
     use reqwest::StatusCode;
 
     use crate::config::RetryConfig;
-    use crate::retry::{backoff_delay, compatibility_fallback_status, is_retryable_http_status};
+    use crate::retry::{backoff_delay, compatibility_fallback_status, is_retryable_post_status};
 
     #[test]
-    fn classifies_retryable_http_statuses() {
-        assert!(is_retryable_http_status(StatusCode::BAD_GATEWAY));
-        assert!(is_retryable_http_status(StatusCode::SERVICE_UNAVAILABLE));
-        assert!(!is_retryable_http_status(StatusCode::BAD_REQUEST));
+    fn only_retries_posts_the_server_refused() {
+        assert!(is_retryable_post_status(StatusCode::SERVICE_UNAVAILABLE));
+        assert!(!is_retryable_post_status(StatusCode::BAD_GATEWAY));
+        assert!(!is_retryable_post_status(StatusCode::GATEWAY_TIMEOUT));
     }
 
     #[test]
@@ -74,13 +89,24 @@ mod tests {
     }
 
     #[test]
-    fn respects_retry_hint() {
+    fn honors_retry_hint_without_scaling() {
         let config = RetryConfig {
             count: 3,
             base_delay: Duration::from_millis(100),
         };
 
-        let delay = backoff_delay(&config, 0, Some(Duration::from_millis(250)));
-        assert!(delay >= Duration::from_millis(250));
+        let delay = backoff_delay(&config, 4, Some(Duration::from_millis(250)));
+        assert_eq!(delay, Duration::from_millis(250));
+    }
+
+    #[test]
+    fn caps_exponential_backoff() {
+        let config = RetryConfig {
+            count: 1_000,
+            base_delay: Duration::from_secs(1),
+        };
+
+        let delay = backoff_delay(&config, 999, None);
+        assert!(delay < Duration::from_secs(32), "delay was {delay:?}");
     }
 }

@@ -13,24 +13,21 @@ pub struct FerryProcess {
 
 impl FerryProcess {
     pub async fn spawn_stdio() -> Result<Self, Box<dyn std::error::Error>> {
-        let port = open_port()?;
-        let base_url = format!("http://127.0.0.1:{port}");
-        let child = Command::new(binary_path("ferry")?)
-            .arg("serve")
-            .arg("--listen")
-            .arg(format!("127.0.0.1:{port}"))
-            .arg("stdio")
-            .arg("--")
-            .arg(binary_path("ferry_test_server")?)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::inherit())
-            .kill_on_drop(true)
-            .spawn()?;
+        Self::spawn_stdio_with(&[]).await
+    }
 
-        let process = Self { base_url, child };
-        process.wait_for_health().await?;
-        Ok(process)
+    /// Spawns `ferry serve <serve_args> stdio -- ferry_test_server`.
+    pub async fn spawn_stdio_with(serve_args: &[&str]) -> Result<Self, Box<dyn std::error::Error>> {
+        let mut args = serve_args
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        args.extend([
+            "stdio".to_string(),
+            "--".to_string(),
+            binary_path("ferry_test_server")?,
+        ]);
+        Self::spawn(args).await
     }
 
     #[allow(dead_code)]
@@ -38,17 +35,32 @@ impl FerryProcess {
         upstream_url: &str,
         transport: &str,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::spawn_relay_with(upstream_url, transport, &[]).await
+    }
+
+    /// Spawns `ferry serve relay --url <upstream_url> --transport <transport> <relay_args>`.
+    #[allow(dead_code)]
+    pub async fn spawn_relay_with(
+        upstream_url: &str,
+        transport: &str,
+        relay_args: &[&str],
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let args = ["relay", "--url", upstream_url, "--transport", transport]
+            .iter()
+            .chain(relay_args)
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        Self::spawn(args).await
+    }
+
+    async fn spawn(args: Vec<String>) -> Result<Self, Box<dyn std::error::Error>> {
         let port = open_port()?;
         let base_url = format!("http://127.0.0.1:{port}");
         let child = Command::new(binary_path("ferry")?)
             .arg("serve")
             .arg("--listen")
             .arg(format!("127.0.0.1:{port}"))
-            .arg("relay")
-            .arg("--url")
-            .arg(upstream_url)
-            .arg("--transport")
-            .arg(transport)
+            .args(args)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())

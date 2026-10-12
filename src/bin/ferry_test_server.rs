@@ -8,6 +8,7 @@ use tokio::sync::mpsc;
 use tokio::time::sleep;
 
 const PROTOCOL_VERSION: &str = "2025-11-25";
+const UNSUPPORTED_PROTOCOL_VERSION: &str = "unsupported";
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -43,6 +44,23 @@ async fn handle_message(message: Value, sender: &mpsc::Sender<Value>) -> Result<
             let id = request_id(&message).ok_or_else(|| {
                 Error::InvalidResponse("initialize request was missing an id".to_string())
             })?;
+            let requested_version = message
+                .pointer("/params/protocolVersion")
+                .and_then(Value::as_str);
+            if requested_version == Some(UNSUPPORTED_PROTOCOL_VERSION) {
+                return send_message(
+                    sender,
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "error": {
+                            "code": -32602,
+                            "message": "unsupported protocol version"
+                        }
+                    }),
+                )
+                .await;
+            }
             send_message(
                 sender,
                 json!({

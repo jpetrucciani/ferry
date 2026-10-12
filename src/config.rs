@@ -114,6 +114,7 @@ struct FileServeConfig {
     legacy_messages_path: Option<String>,
     health_path: Option<String>,
     allow_origins: Option<Vec<String>>,
+    idle_timeout: Option<u64>,
     auth: Option<FileServeAuthConfig>,
     logging: Option<FileLoggingConfig>,
     stdio: Option<FileServeStdioConfig>,
@@ -167,6 +168,7 @@ struct PartialServeConfig {
     auth_bearer_token: Option<String>,
     auth_headers: BTreeMap<String, String>,
     allow_origins: Option<Vec<String>>,
+    idle_timeout_seconds: Option<u64>,
     log_level: Option<LogLevel>,
     log_file: Option<PathBuf>,
     backend: Option<PartialServeBackendConfig>,
@@ -414,6 +416,7 @@ fn load_file_serve_config(path: &Path) -> Result<PartialServeConfig> {
             serve.auth.map(|auth| auth.headers).unwrap_or_default(),
         )?,
         allow_origins: serve.allow_origins,
+        idle_timeout_seconds: serve.idle_timeout,
         log_level: match serve
             .logging
             .as_ref()
@@ -490,6 +493,7 @@ fn load_env_serve_config() -> Result<PartialServeConfig> {
         auth_bearer_token: env::var("FERRY_SERVE_AUTH_BEARER_TOKEN").ok(),
         auth_headers: load_env_header_map("FERRY_SERVE_AUTH_HEADER_")?,
         allow_origins: read_env_csv("FERRY_SERVE_ALLOW_ORIGINS"),
+        idle_timeout_seconds: read_env_u64("FERRY_SERVE_IDLE_TIMEOUT")?,
         log_level: match env::var("FERRY_SERVE_LOG_LEVEL").ok() {
             Some(value) => Some(parse_log_level(&value)?),
             None => None,
@@ -548,6 +552,7 @@ fn load_cli_serve_config(cli: &ServeCli) -> Result<PartialServeConfig> {
         auth_bearer_token: cli.auth_bearer_token.clone(),
         auth_headers: parse_header_inputs(&cli.auth_headers)?,
         allow_origins: (!cli.allow_origins.is_empty()).then_some(cli.allow_origins.clone()),
+        idle_timeout_seconds: cli.idle_timeout,
         log_level: cli.log_level.map(LogLevel::from),
         log_file: cli.log_file.clone(),
         backend,
@@ -631,6 +636,9 @@ fn apply_serve_partial(target: &mut PartialServeConfig, overlay: PartialServeCon
     }
     if overlay.allow_origins.is_some() {
         target.allow_origins = overlay.allow_origins;
+    }
+    if overlay.idle_timeout_seconds.is_some() {
+        target.idle_timeout_seconds = overlay.idle_timeout_seconds;
     }
     if overlay.log_level.is_some() {
         target.log_level = overlay.log_level;
@@ -719,6 +727,7 @@ fn resolve_serve_cli(partial: PartialServeConfig) -> Result<ServeCli> {
         auth_bearer_token: partial.auth_bearer_token,
         auth_headers: header_map_to_inputs(partial.auth_headers),
         allow_origins: partial.allow_origins.unwrap_or_default(),
+        idle_timeout: partial.idle_timeout_seconds,
         log_level: Some(partial.log_level.unwrap_or(LogLevel::Warn).into()),
         log_file: partial.log_file,
         config: None,
@@ -1077,6 +1086,7 @@ mod tests {
             auth_bearer_token: None,
             auth_headers: Vec::new(),
             allow_origins: Vec::new(),
+            idle_timeout: None,
             log_level: None,
             log_file: None,
             config,

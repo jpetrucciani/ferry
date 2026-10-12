@@ -84,6 +84,10 @@ pub struct ServeCli {
     #[arg(long = "allow-origin")]
     pub allow_origins: Vec<String>,
 
+    /// Seconds a session may sit with no requests and no open stream before it is shut down.
+    #[arg(long = "idle-timeout")]
+    pub idle_timeout: Option<u64>,
+
     #[arg(long = "log-level", value_enum)]
     pub log_level: Option<LogLevelArg>,
 

@@ -54,7 +54,7 @@ let
   };
   bin = rustPlatform.buildRustPackage (finalAttrs: {
     pname = name;
-    version = "0.0.0";
+    version = "0.0.2";
     src = pkgs.hax.filterSrc { path = ./.; };
     cargoLock.lockFile = ./Cargo.lock;
     auditable = false;

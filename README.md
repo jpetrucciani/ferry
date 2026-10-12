@@ -269,6 +269,7 @@ path = "/mcp"
 legacy_sse_path = "/sse"
 legacy_messages_path = "/messages"
 health_path = "/health"
+idle_timeout = 1800
 
 [serve.auth]
 bearer_token = "${FERRY_SHARED_TOKEN}"
@@ -292,6 +293,9 @@ base_delay_ms = 1000
 Notes:
 
 - `ferry serve` follows the same precedence as client mode, `CLI > env > config > defaults`
+- `timeout` bounds connecting, `initialize`, notifications, and SSE setup. Other JSON-RPC requests (for example slow tool calls) wait for the server, relying on the MCP client's own request timeout and cancellation
+- Requests are only retried when they provably never reached the server (connection failures and HTTP 503), so tool calls are never sent twice
+- serve sessions with no requests and no open stream for `idle_timeout` seconds (default 1800, also `--idle-timeout` or `FERRY_SERVE_IDLE_TIMEOUT`) are shut down, which stops their stdio backend
 - `FERRY_SERVE_STDIO_ARGS` expects a JSON string array, for example `FERRY_SERVE_STDIO_ARGS='[\"--stdio\"]'`
 
 ## Development
